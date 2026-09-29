@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from ..models import GameSession, Resident, Facility, EventLog
 from ..core.config import INITIAL_RESOURCES, SURVIVAL_TARGET_DAY
 
+import uuid
+
 # 资源键
 FOOD, WATER, POWER, OXY = "food", "water", "power", "oxygen"
 RESOURCE_KEYS = [FOOD, WATER, POWER, OXY]
@@ -55,11 +57,33 @@ class BunkerEngineError(Exception):
     pass
 
 
+class BunkerEngineConflict(BunkerEngineError):
+    """并发冲突（乐观锁版本不匹配），HTTP 层映射为 409。"""
+
+
+# 档案状态机阶段：
+#   daily  —— 每日阶段，可建造/升级/调岗，可推进一天
+#   crisis —— 危机阶段，存在待处理危机，除结算危机外拒绝一切推进与经营动作
+#   ended  —— 终局（win/over），拒绝任何状态变更
+PHASE_DAILY, PHASE_CRISIS, PHASE_ENDED = "daily", "crisis", "ended"
+
+
 class BunkerEngine:
     def __init__(self, db: Session, session: GameSession, rand=None):
         self.db = db
         self.session = session
         self.rand = rand or _rng()
+
+    # ---- 状态机 ----
+    @property
+    def phase(self):
+        if self.session.status != "running":
+            return PHASE_ENDED
+        return PHASE_CRISIS if self.session.pending_crisis else PHASE_DAILY
+
+    def _require_phase(self, phase, message):
+        if self.phase != phase:
+            raise BunkerEngineError(message)
 
     # ---- 资源查询 ----
     def get_resources(self):
@@ -104,14 +128,16 @@ class BunkerEngine:
 
     # ---- 每日推进 ----
     def advance_day(self):
-        if self.session.status != "running":
-            raise BunkerEngineError("游戏已结束，无法继续推进")
+        # 终局或存在待处理危机时都不能推进：危机不可被“再点一天”跳过
+        self._require_phase(PHASE_DAILY, "存在待处理危机，必须先做出抉择才能推进")
         self.session.day += 1
         self._apply_production_and_consumption()
         self._apply_health_morale()
-        crisis = self._maybe_trigger_crisis()
-        self._check_end()
-        return crisis
+        # 终局优先：抵达目标日或全面崩溃直接结算结局，不再凭空挂起一个
+        # 永远无法处理的危机（统一每日推进 → 危机处理 → 终局的流转）
+        if self._check_end():
+            return None
+        return self._maybe_trigger_crisis()
 
     def _apply_production_and_consumption(self):
         pop = self.session.survivors
@@ -235,19 +261,23 @@ class BunkerEngine:
     def _maybe_trigger_crisis(self):
         if self.rand.random() > CRISIS_DAY_CHANCE:
             return None
-        crises = CRISIS_POOL
-        event = self.rand.choice(crises)
-        return self._apply_crisis(event)
+        event = self.rand.choice(CRISIS_POOL)
+        crisis = self._build_crisis(event)
+        # 待处理危机整体写入存档：事件、目标、选项与一次性 token 一起绑定，
+        # 刷新页面后凭档案即可恢复同一个决策
+        self.session.pending_crisis = crisis
+        return crisis
 
-    def _apply_crisis(self, event):
+    def _build_crisis(self, event):
         # 仅当事件存在单体效果的决策时才抽取受影响居民；
         # 全体事件不产生目标，前端也无从回传 target_id
         needs_target = self._event_needs_target(event)
         alive = [r for r in self.session.residents if r.alive]
         target = self.rand.choice(alive) if needs_target and alive else None
-        opts = event["choices"]
         return {
+            "token": uuid.uuid4().hex,  # 本次待处理危机的一次性凭据
             "event": event["key"],
+            "day": self.session.day,
             "title": event["title"],
             "desc": event["desc"],
             "needs_target": needs_target,
@@ -260,7 +290,7 @@ class BunkerEngine:
                     "hint": c.get("hint", ""),
                     "targeted": self._choice_targeted(c),
                 }
-                for c in opts
+                for c in event["choices"]
             ],
         }
 
@@ -278,6 +308,36 @@ class BunkerEngine:
         """结算边界：游戏结束后拒绝一切状态变更。"""
         if self.session.status != "running":
             raise BunkerEngineError("游戏已结束，无法执行该操作")
+
+    def _require_daily_phase(self, action):
+        """经营/推进类动作只允许在每日阶段执行。"""
+        self._ensure_running()
+        if self.phase == PHASE_CRISIS:
+            raise BunkerEngineError(f"存在待处理危机，必须先完成抉择才能{action}")
+
+    def _pending_event(self):
+        """取出当前待处理危机对应的事件定义；存档损坏时视为无法结算。"""
+        pending = self.session.pending_crisis
+        if not pending:
+            return None, None
+        event_key = pending.get("event")
+        event = next((e for e in CRISIS_POOL if e["key"] == event_key), None)
+        if event is None:
+            raise BunkerEngineError("待处理危机已失效，请刷新档案后重试")
+        return pending, event
+
+    @staticmethod
+    def _matches_resolution(rec, event_key, choice_key, target_id, day=None):
+        """判断落败/重试请求是否就是上一次已完成的那次结算（幂等回放）。
+
+        除事件/选项/目标外还核对危机发生日，避免不同天的同类型危机被误重放；
+        day 为 None（调用方拿不到上下文）时退化为不校验天数。
+        """
+        if not rec or rec.get("event") != event_key or rec.get("choice") != choice_key:
+            return False
+        if day is not None and rec.get("day") is not None and rec.get("day") != day:
+            return False
+        return (rec.get("target_id") or None) == (target_id or None)
 
     def _resolve_target(self, target_id, required):
         """统一解析目标居民。
@@ -298,12 +358,36 @@ class BunkerEngine:
             raise BunkerEngineError("目标居民已故，无法作为效果目标")
         return target
 
-    def resolve_crisis(self, event_key, choice_key, target_id=None):
-        """根据选择执行效果，返回结果描述。"""
+    def resolve_crisis(self, event_key, choice_key, target_id=None, token=None):
+        """结算待处理危机。
+
+        结算必须命中档案里唯一的待处理危机：事件、选项、单体目标都与存档绑定，
+        既不能凭空伪造一场危机（无待处理危机时拒绝），也不能重复结算
+        （结算后待处理危机被清除并留下幂等凭据，重放只返回上次结果）。
+        返回 (detail, replayed)：replayed=True 表示这是重复请求，未再次施加效果。
+        """
         self._ensure_running()
-        event = next((e for e in CRISIS_POOL if e["key"] == event_key), None)
-        if not event:
-            raise BunkerEngineError("未知危机事件")
+        pending, event = self._pending_event()
+
+        # 已有同一危机（事件/选项/目标/发生日一致）的结算记录：
+        # 重复提交（含并发落败方）只回放，不二次结算
+        pending_day = pending.get("day") if pending else None
+        if self._matches_resolution(
+            self.session.last_resolution, event_key, choice_key, target_id, day=pending_day
+        ):
+            return self.session.last_resolution.get("detail", ""), True
+
+        if pending is None:
+            raise BunkerEngineError("当前没有待处理的危机，无法结算")
+
+        # 事件必须与存档中的待处理危机一致：不能用 A 事件的请求去结算 B
+        if event_key != pending.get("event"):
+            raise BunkerEngineError("危机事件与当前待处理事件不符")
+        # token 用于区分“同一危机上一次的旧点击”与刷新后恢复的当前决策；
+        # 旧客户端/旧档案没有 token 时退化为仅按事件匹配
+        if token is not None and pending.get("token") and token != pending["token"]:
+            raise BunkerEngineConflict("该危机决策已过期，请按当前危机重新选择")
+
         choice = next((c for c in event["choices"] if c["key"] == choice_key), None)
         if not choice:
             raise BunkerEngineError("未知决策选项")
@@ -313,6 +397,13 @@ class BunkerEngine:
         # 作用域由所选决策的效果声明决定，客户端传入的 target_id 不能改变它：
         # 单体效果必须携带有效目标，全体效果一律忽略客户端目标
         targeted = self._choice_targeted(choice)
+        if targeted:
+            # 目标与待处理危机绑定：不能用任意/其他居民编号替换事件目标
+            bound_id = pending.get("target_id")
+            if target_id is None:
+                raise BunkerEngineError("该决策需要指定一名幸存者作为目标")
+            if bound_id is not None and target_id != bound_id:
+                raise BunkerEngineError("目标居民与本次危机指定的幸存者不符")
         # 在应用任何效果前完成目标校验，保证失败时档案状态不发生部分变更
         target = self._resolve_target(target_id, required=targeted)
 
@@ -347,8 +438,32 @@ class BunkerEngine:
         scope_zh = f"（目标：{target.name}）" if targeted else ""
         detail = "，".join(detail_parts) if detail_parts else "无显著变化"
         self._log("crisis", event["title"], f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
+
+        # 清除待处理危机并记下幂等凭据——无论后续是否终局，本危机都已结算
+        self.session.pending_crisis = None
+        self.session.last_resolution = {
+            "token": pending.get("token"),
+            "event": event["key"],
+            "choice": choice["key"],
+            "target_id": target.id if targeted else None,
+            "day": pending.get("day"),
+            "detail": detail,
+        }
         self._check_end()
-        return detail
+        return detail, False
+
+    def reconcile_stale_resolution(self, event_key, choice_key, target_id, token=None):
+        """并发落败（版本冲突）后核对：若对方提交的是同一次结算则安全回放。
+
+        返回 (detail, replayed)；请求与任何已知结算都对不上时抛 409，
+        由调用方提示“危机状态已变化”，杜绝并发重复结算。
+        """
+        rec = self.session.last_resolution
+        if self._matches_resolution(rec, event_key, choice_key, target_id) and (
+            token is None or not rec.get("token") or token == rec.get("token")
+        ):
+            return rec.get("detail", ""), True
+        raise BunkerEngineConflict("危机状态已被其他请求更新，请刷新后重试")
 
     def _add_resident(self, name):
         r = Resident(
@@ -365,7 +480,7 @@ class BunkerEngine:
 
     # ---- 扩建 ----
     def build_facility(self, category):
-        self._ensure_running()
+        self._require_daily_phase("建造设施")
         cost = FACILITY_COST[1]
         if not self._can_afford(cost):
             raise BunkerEngineError("资源不足，无法建造")
@@ -385,7 +500,7 @@ class BunkerEngine:
         return f
 
     def upgrade_facility(self, facility_id):
-        self._ensure_running()
+        self._require_daily_phase("升级设施")
         f = next((x for x in self.session.facilities if x.id == facility_id), None)
         if not f:
             raise BunkerEngineError("设施不存在")
@@ -406,7 +521,7 @@ class BunkerEngine:
 
     # ---- 任务分配（重分配岗位）----
     def set_job(self, resident_id, job):
-        self._ensure_running()
+        self._require_daily_phase("调整岗位")
         if job not in JOB_EFFICIENCY:
             raise BunkerEngineError("未知岗位")
         r = next((x for x in self.session.residents if x.id == resident_id), None)
@@ -417,22 +532,26 @@ class BunkerEngine:
     # ---- 结局判定 ----
     def _check_end(self):
         if self.session.status != "running":
-            return
+            return True
         # 胜利：存活达到目标天数
         if self.session.day >= self.session.target_day:
             self._finish(win=True, reason=f"坚持到第{self.session.day}天，末日阴影散去，幸存者们走向了新生。")
-            return
+            return True
         # 失败：人口归零
         if self.session.survivors <= 0:
             self._finish(win=False, reason="所有幸存者都已逝去，地堡陷入永恒的寂静。")
-            return
+            return True
         # 失败：血量濒临且资源全面崩溃
         res = self.get_resources()
         if all(res.get(k, 0) <= 1 for k in RESOURCE_KEYS):
             self._finish(win=False, reason="食物、水源、电力和氧气全线枯竭，地堡无法再维系生命。")
+            return True
+        return False
 
     def _finish(self, win, reason):
         self.session.status = "win" if win else "over"
+        # 进入终局后不存在悬而未决的危机，状态机统一收敛到 ended
+        self.session.pending_crisis = None
         alive = [r for r in self.session.residents if r.alive]
         # 计分：幸存者 * 天数 * 士气系数
         morale = self.avg_morale()

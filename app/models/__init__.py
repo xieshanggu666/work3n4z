@@ -18,6 +18,11 @@ from ..core.database import Base
 class GameSession(Base):
     __tablename__ = "game_sessions"
 
+    # 乐观锁版本号：并发的每日推进/危机结算只会有一个请求落库，
+    # 落败请求在 UPDATE 时因版本不匹配失败，从而杜绝重复结算
+    row_version = Column(Integer, nullable=False, default=1)
+    __mapper_args__ = {"version_id_col": row_version}
+
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(64), nullable=False, default="末日地堡档案")
     day = Column(Integer, nullable=False, default=1)
@@ -25,6 +30,11 @@ class GameSession(Base):
     status = Column(String(16), nullable=False, default="running")  # running/over/win
     resources = Column(JSON, nullable=False, default=dict)  # {food,water,power,oxygen}
     survivors = Column(Integer, nullable=False, default=0)
+    # 待处理危机快照（含一次性 token、绑定的事件与目标），落库后刷新可恢复决策；
+    # 为 None 表示当前处于“每日阶段”，不允许凭空结算危机
+    pending_crisis = Column(JSON, nullable=True)
+    # 最近一次危机结算的幂等凭据，重复/并发落败请求据此安全回放，不再二次结算
+    last_resolution = Column(JSON, nullable=True)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

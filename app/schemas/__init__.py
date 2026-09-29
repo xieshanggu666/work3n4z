@@ -68,6 +68,8 @@ class SessionDetail(BaseModel):
     survivors: int
     score: int
     outcome: Optional[Dict[str, Any]] = None
+    # 待处理危机快照：刷新/重进档案后前端据此恢复决策弹层
+    pending_crisis: Optional[Dict[str, Any]] = None
     residents: List[ResidentOut] = []
     facilities: List[FacilityOut] = []
     logs: List[LogOut] = []
@@ -82,6 +84,8 @@ class CrisisChoice(BaseModel):
     event_key: str
     choice_key: str
     target_id: Optional[int] = None
+    # 待处理危机的一次性凭据，用于识别过期/并发的旧请求；旧客户端可省略
+    token: Optional[str] = None
 
 
 class JobAssign(BaseModel):

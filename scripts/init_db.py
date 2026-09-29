@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.database import Base, engine, SessionLocal
+from app.core.migration import ensure_schema
 from app.core.config import INITIAL_RESOURCES, SURVIVAL_TARGET_DAY
 from app.models import GameSession, Resident, Facility
 from app.services.engine import FACILITY_ZH
@@ -13,6 +14,7 @@ from app.services.engine import FACILITY_ZH
 
 def main():
     Base.metadata.create_all(bind=engine)
+    ensure_schema(engine)
     db = SessionLocal()
     try:
         # 若已有档案则不重复造演示数据

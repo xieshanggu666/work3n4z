@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from ..core.database import get_db
 from ..core.config import INITIAL_RESOURCES, SURVIVAL_TARGET_DAY
@@ -8,6 +9,7 @@ from ..models import GameSession, Resident, Facility
 from ..services.engine import (
     BunkerEngine,
     BunkerEngineError,
+    BunkerEngineConflict,
     RESOURCE_KEYS,
     FACILITY_OUTPUT,
     FACILITY_COST,
@@ -142,6 +144,7 @@ def get_session_detail(gs, db):
         survivors=gs.survivors,
         score=gs.score,
         outcome=gs.outcome,
+        pending_crisis=gs.pending_crisis,
         residents=residents,
         facilities=facilities,
         logs=logs,
@@ -149,6 +152,30 @@ def get_session_detail(gs, db):
 
 
 # ---- 游戏动作 ----
+def _run_mutation(db, gs, action):
+    """统一执行经营类状态变更。
+
+    - 业务校验失败（BunkerEngineError）→ 400
+    - 乐观锁版本冲突（并发请求已先行落库，StaleDataError）→ 409，
+      落败方不产生任何效果，避免重复推进/重复扣费
+    """
+    eng = BunkerEngine(db, gs)
+    try:
+        action(eng)
+        db.commit()
+        db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        db.rollback()
+        db.refresh(gs)
+        raise HTTPException(409, "档案已被其他请求更新，请刷新后重试")
+
+
 @router.post("/sessions/{sid}/advance", response_model=AdvanceResult)
 def advance(sid: int, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
@@ -162,6 +189,12 @@ def advance(sid: int, db: Session = Depends(get_db)):
     except BunkerEngineError as e:
         db.rollback()
         raise HTTPException(400, str(e))
+    except StaleDataError:
+        # 并发/重复的“推进一天”落败：另一个请求已经推进过，这里幂等回放
+        # 当前状态（含可能已挂起的待处理危机），绝不再多推进一天
+        db.rollback()
+        db.refresh(gs)
+        crisis = gs.pending_crisis
     return AdvanceResult(session=get_session_detail(gs, db), crisis=crisis)
 
 
@@ -172,12 +205,29 @@ def resolve_crisis(sid: int, body: CrisisChoice, db: Session = Depends(get_db)):
         raise HTTPException(404, "档案不存在")
     eng = BunkerEngine(db, gs)
     try:
-        eng.resolve_crisis(body.event_key, body.choice_key, body.target_id)
+        eng.resolve_crisis(
+            body.event_key, body.choice_key, body.target_id, token=body.token
+        )
         db.commit()
         db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
     except BunkerEngineError as e:
         db.rollback()
         raise HTTPException(400, str(e))
+    except StaleDataError:
+        # 并发的重复结算：版本不匹配说明对方已先落库。核对是否同一次抉择：
+        # 相同则幂等回放当前状态（效果只结算一次），否则 409 拒绝
+        db.rollback()
+        db.refresh(gs)
+        replay_eng = BunkerEngine(db, gs)
+        try:
+            replay_eng.reconcile_stale_resolution(
+                body.event_key, body.choice_key, body.target_id, token=body.token
+            )
+        except BunkerEngineConflict as e:
+            raise HTTPException(409, str(e))
     return get_session_detail(gs, db)
 
 
@@ -188,14 +238,7 @@ def build(sid: int, body: BuildRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, "档案不存在")
     if body.category not in FACILITY_OUTPUT:
         raise HTTPException(400, "未知设施类别")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.build_facility(body.category)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+    _run_mutation(db, gs, lambda eng: eng.build_facility(body.category))
     return get_session_detail(gs, db)
 
 
@@ -204,14 +247,7 @@ def upgrade(sid: int, fid: int, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
     if not gs:
         raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.upgrade_facility(fid)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+    _run_mutation(db, gs, lambda eng: eng.upgrade_facility(fid))
     return get_session_detail(gs, db)
 
 
@@ -220,14 +256,7 @@ def set_job(sid: int, rid: int, body: JobAssign, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
     if not gs:
         raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.set_job(rid, body.job)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+    _run_mutation(db, gs, lambda eng: eng.set_job(rid, body.job))
     return get_session_detail(gs, db)
 
 
