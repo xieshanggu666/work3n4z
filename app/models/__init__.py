@@ -25,6 +25,11 @@ class GameSession(Base):
     status = Column(String(16), nullable=False, default="running")  # running/over/win
     resources = Column(JSON, nullable=False, default=dict)  # {food,water,power,oxygen}
     survivors = Column(Integer, nullable=False, default=0)
+    # 待处理危机（已触发、等待玩家决策）。结构：
+    # {"event":key,"title":..,"desc":..,"needs_target":bool,
+    #  "target_id":int|None,"target_name":str|None,"choices":[..]}
+    # None 表示当前无待决策危机——刷新页面后据此恢复决策弹层
+    pending_crisis = Column(JSON, nullable=True)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

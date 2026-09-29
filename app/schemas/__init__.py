@@ -67,6 +67,7 @@ class SessionDetail(BaseModel):
     resources: Dict[str, float]
     survivors: int
     score: int
+    pending_crisis: Optional[Dict[str, Any]] = None
     outcome: Optional[Dict[str, Any]] = None
     residents: List[ResidentOut] = []
     facilities: List[FacilityOut] = []

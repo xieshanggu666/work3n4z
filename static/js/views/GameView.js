@@ -24,53 +24,73 @@ window.GameView = {
           Api.get("/api/buildings"),
         ]);
         this.s = s; this.config = cfg; this.buildings = bld;
+        // 刷新/重进后从存档恢复未结算的危机决策（危机已随档案持久化）
+        this.crisis = s.pending_crisis || null;
       } catch (e) { this.error = e.message; }
     },
     async loadSession() {
       this.s = await Api.get(`/api/sessions/${this.sid}`);
+      // 任何刷新都以后端存档中的待处理危机为准
+      this.crisis = this.s.pending_crisis || null;
     },
     async advance() {
       this.error = "";
       if (this.s.status !== "running") return;
+      if (this.crisis) { this.error = "请先处理当前危机"; return; }
       this.loading = true;
       try {
         const r = await Api.post(`/api/sessions/${this.sid}/advance`);
         this.s = r.session;
         this.crisis = r.crisis;
-      } catch (e) { this.error = e.message; }
+      } catch (e) {
+        this.error = e.message;
+        // 并发/过期状态下重新拉取，与服务端存档对齐
+        await this.loadSession();
+      }
       finally { this.loading = false; }
     },
     async resolve(c) {
       this.error = "";
       this.loading = true;
       try {
-        // 目标语义以后端下发的 c.targeted 为准：
-        // 仅单体决策回传 target_id；全体决策显式传 null，
-        // 避免危机事件的随机目标被无条件带回、把全体效果收窄成一人
+        // 目标以后端在危机触发时绑定、随存档下发的 target_id 为准；
+        // 单体决策回传该绑定目标，全体决策传 null。
+        // 服务端只结算存档中挂起的这一个事件，重复/并发请求只生效一次。
         const body = {
           event_key: this.crisis.event,
           choice_key: c.key,
           target_id: c.targeted ? this.crisis.target_id : null,
         };
         this.s = await Api.post(`/api/sessions/${this.sid}/resolve`, body);
-        this.crisis = null;
-      } catch (e) { this.error = e.message; }
+        this.crisis = this.s.pending_crisis || null;
+      } catch (e) {
+        this.error = e.message;
+        // 可能是重复/并发请求已被结算：重新拉取权威状态
+        await this.loadSession();
+      }
       finally { this.loading = false; }
     },
     async build(cat) {
       this.error = "";
+      if (this.crisis) { this.error = "请先处理当前危机"; return; }
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/build`, { category: cat });
       } catch (e) { this.error = e.message; }
     },
     async upgrade(fid) {
       this.error = "";
+      if (this.crisis) { this.error = "请先处理当前危机"; return; }
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/upgrade/${fid}`);
       } catch (e) { this.error = e.message; }
     },
     async assignJob(rid, job) {
       this.error = "";
+      if (this.crisis) {
+        this.error = "请先处理当前危机";
+        await this.loadSession();  // 回滚前端下拉框的乐观变化
+        return;
+      }
       try {
         this.s = await Api.post(`/api/sessions/${this.sid}/resident/${rid}/job`, { job });
       } catch (e) { this.error = e.message; }
@@ -88,6 +108,7 @@ window.GameView = {
   },
   computed: {
     alive() { return this.s ? this.s.residents.filter(r => r.alive) : []; },
+    busy() { return this.crisis !== null; },
   },
   template: `
   <div v-if="s" class="game" :class="clazz(s.status)">
@@ -108,8 +129,8 @@ window.GameView = {
         <div class="res-val">{{ fmt(s.resources[k]) }}</div>
         <div class="res-track"><div class="res-fill" :class="k" :style="{ width: resPct(k)+'%' }"></div></div>
       </div>
-      <button class="btn primary advance" :disabled="loading || s.status!=='running'" @click="advance">
-        {{ loading ? '推进中…' : '推进一天' }}
+      <button class="btn primary advance" :disabled="loading || s.status!=='running' || busy" @click="advance">
+        {{ loading ? '推进中…' : (busy ? '待处理危机' : '推进一天') }}
       </button>
     </section>
     <div v-if="error" class="msg err global">{{ error }}</div>
@@ -136,7 +157,7 @@ window.GameView = {
             <span class="fac-name">{{ f.name }}</span>
             <span class="chip">Lv.{{ f.level }}</span>
             <span class="dim">{{ {farm:'产食物',water:'产水源',power:'发电',oxygen:'产氧',med:'医疗',storage:'仓储'}[f.category] }}</span>
-            <button v-if="s.status==='running'" class="btn tiny" @click="upgrade(f.id)">升级</button>
+            <button v-if="s.status==='running'" class="btn tiny" :disabled="busy" @click="upgrade(f.id)">升级</button>
           </div>
         </div>
       </div>
@@ -151,7 +172,7 @@ window.GameView = {
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
           <div class="p-actions" v-if="r.alive && s.status==='running'">
-            <select :value="r.job" @change="assignJob(r.id, $event.target.value)">
+            <select :value="r.job" :disabled="busy" @change="assignJob(r.id, $event.target.value)">
               <option value="engineer">工程师</option>
               <option value="farmer">农民</option>
               <option value="general">杂工</option>
@@ -167,7 +188,7 @@ window.GameView = {
             <span class="bc-name">{{ b.name }}</span>
             <span class="dim">等级加成 x1.6</span>
             <div class="cost" v-for="(v,k) in b.cost" :key="k">{{ {food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] }} {{ v }}</div>
-            <button class="btn small primary" :disabled="s.status!=='running'" @click="build(b.category)">建造</button>
+            <button class="btn small primary" :disabled="s.status!=='running' || busy" @click="build(b.category)">建造</button>
           </div>
         </div>
       </div>

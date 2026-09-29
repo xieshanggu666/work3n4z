@@ -141,6 +141,7 @@ def get_session_detail(gs, db):
         resources={k: gs.resources.get(k, 0) for k in RESOURCE_KEYS},
         survivors=gs.survivors,
         score=gs.score,
+        pending_crisis=gs.pending_crisis,
         outcome=gs.outcome,
         residents=residents,
         facilities=facilities,

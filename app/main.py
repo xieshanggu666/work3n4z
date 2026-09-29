@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from .core.database import Base, engine
+from .core.database import ensure_schema
 from .api.router import router
 
 BASE = Path(__file__).resolve().parent.parent
@@ -13,8 +13,8 @@ STATIC = BASE / "static"
 
 app = FastAPI(title="末日地堡生存", version="1.0.0")
 
-# 仅在建表缺失时初始化（数据库文件已由 init_db 创建时为幂等）
-Base.metadata.create_all(bind=engine)
+# 建表并对旧库做增量迁移（幂等）
+ensure_schema()
 
 app.include_router(router)
 
